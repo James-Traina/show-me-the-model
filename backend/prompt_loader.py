@@ -2,14 +2,15 @@
 Loads YAML prompt files, resolves shared references, and templates in runtime variables.
 
 Two-stage templating:
-  1. Shared resolution: {{ persona }}, {{ tone_guidelines }} resolved from shared/persona.yaml
-  2. Runtime resolution: {{ source_text }}, {{ decomposition }}, etc. resolved at call time
+  1. Shared resolution: {{ persona }}, {{ tone_guidelines }} resolved from
+     shared/persona.yaml
+  2. Runtime resolution: {{ source_text }}, {{ decomposition }}, etc. at call time
 """
 
-import os
 import re
-import yaml
 from pathlib import Path
+
+import yaml
 
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 SHARED_DIR = PROMPTS_DIR / "shared"
@@ -42,6 +43,7 @@ def _load_shared() -> dict[str, str]:
 
 def _resolve_templates(text: str, variables: dict[str, str]) -> str:
     """Replace {{ variable }} placeholders with values from the variables dict."""
+
     def replacer(match):
         key = match.group(1).strip()
         if key in variables:
@@ -58,7 +60,8 @@ def load_prompt(yaml_filename: str) -> dict:
 
     Returns a dict with:
       - name, version, stage, model, temperature, max_tokens
-      - system_prompt: shared variables resolved, runtime variables still as {{ placeholders }}
+      - system_prompt: shared variables resolved, runtime variables still as
+        {{ placeholders }}
       - user_prompt_template: runtime variables still as {{ placeholders }}
     """
     path = PROMPTS_DIR / yaml_filename

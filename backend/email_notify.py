@@ -1,16 +1,16 @@
 """Best-effort email notification when pipeline completes."""
 
+import json
 import logging
 import os
-import json
-from urllib.request import Request, urlopen
 from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
 
 
 async def send_results_email(email: str, analysis_id: str, base_url: str):
-    """Send a results-ready email via Resend HTTP API. Fails silently with a warning log."""
+    """Send a results-ready email via Resend HTTP API. Fails silently with a warning."""
     try:
         api_key = os.getenv("RESEND_API_KEY")
         from_addr = os.getenv("SMTP_FROM", "noreply@showmethemodel.io")
@@ -37,12 +37,14 @@ async def send_results_email(email: str, analysis_id: str, base_url: str):
 </body>
 </html>"""
 
-        payload = json.dumps({
-            "from": from_addr,
-            "to": [email],
-            "subject": "Your Show Me the Model analysis is ready",
-            "html": html,
-        }).encode("utf-8")
+        payload = json.dumps(
+            {
+                "from": from_addr,
+                "to": [email],
+                "subject": "Your Show Me the Model analysis is ready",
+                "html": html,
+            }
+        ).encode("utf-8")
 
         req = Request(
             "https://api.resend.com/emails",
@@ -56,13 +58,25 @@ async def send_results_email(email: str, analysis_id: str, base_url: str):
         )
 
         with urlopen(req) as resp:
-            logger.info("Results email sent to %s for analysis %s (status %s)", email, analysis_id, resp.status)
+            logger.info(
+                "Results email sent to %s for analysis %s (status %s)",
+                email,
+                analysis_id,
+                resp.status,
+            )
 
     except URLError as exc:
         logger.warning(
-            "Failed to send email to %s for analysis %s: %s", email, analysis_id, exc, exc_info=True
+            "Failed to send email to %s for analysis %s: %s",
+            email,
+            analysis_id,
+            exc,
+            exc_info=True,
         )
     except Exception:
         logger.warning(
-            "Failed to send email to %s for analysis %s", email, analysis_id, exc_info=True
+            "Failed to send email to %s for analysis %s",
+            email,
+            analysis_id,
+            exc_info=True,
         )
