@@ -45,6 +45,15 @@ def _estimate_cost(usage_records: list[dict]) -> float:
     return round(total, 4)
 
 
+# Each tuple is (prompt_yaml_filename, pass_name_key).
+# The six passes analyze the same essay through different economic lenses:
+#   identities    — accounting identities and hidden assumptions
+#   general_eq    — general-equilibrium effects ignored by partial analysis
+#   exog_endog    — which variables the author treats as fixed vs. determined
+#   quantitative  — empirical claims, magnitudes, and missing data
+#   consistency   — internal contradictions and logical gaps
+#   steelman      — strongest version of the argument + counterarguments
+# All six run in parallel (batched for rate limits); results are merged in Stage 2.5.
 STAGE2_PASSES = [
     ("stage2_identities.yaml", "identities"),
     ("stage2_general_eq.yaml", "general_eq"),
@@ -150,6 +159,8 @@ async def _call_claude(
         return text, response.usage.input_tokens, response.usage.output_tokens
 
     def build_correction_messages(bad_text: str) -> None:
+        # messages[:] mutates the list in place so the api_call closure
+        # (which captured the same list object) sees the updated history.
         messages[:] = [
             {"role": "user", "content": user_prompt},
             {"role": "assistant", "content": bad_text},
@@ -172,7 +183,8 @@ def _map_model_for_openai(model: str) -> str:
     return model_map.get(model, model)
 
 
-# Models that only accept temperature=1 (the default)
+# gpt-5-mini uses a fixed sampling temperature and rejects any explicit value.
+# Passing temperature= raises an API error, so we omit it for this model.
 _OPENAI_NO_TEMPERATURE = {"gpt-5-mini"}
 
 
@@ -197,6 +209,8 @@ async def _call_openai(
         "model": model,
         "max_completion_tokens": max_tokens,
         "messages": messages,
+        # json_object mode forces the model to return valid JSON, eliminating
+        # most parse failures without needing the correction-prompt retry loop.
         "response_format": {"type": "json_object"},
     }
     if model not in _OPENAI_NO_TEMPERATURE:
@@ -455,11 +469,16 @@ async def run_stage2(
     logger.info("Stage 2: Parallel analysis passes")
     decomposition_json = json.dumps(decomposition, indent=2)
 
-    # Load field-specific examples based on stage 1 classification
+    # Stage 1 classifies the essay into an economics sub-field (e.g. macro_fiscal,
+    # trade, labor). Field-specific few-shot examples are injected into each Stage 2
+    # prompt so the model uses domain-appropriate terminology and framings.
     field = decomposition.get("field", "macro_fiscal")
     field_examples = load_field_examples(field)
     logger.info("  Field classification: %s", field)
 
+    # Run passes in small batches to stay within API rate limits.
+    # With long essays each call uses ~10k input tokens; at batch_size=2 we
+    # send 2 concurrent requests, pause, then send the next 2, etc.
     results = {}
     usage_records = []
     for i in range(0, len(STAGE2_PASSES), batch_size):
