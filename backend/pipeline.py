@@ -10,8 +10,10 @@ Stage 3:   Synthesis (1 Opus call)
 import asyncio
 import json
 import logging
-from pathlib import Path
+from typing import Any, Callable, Coroutine
+
 from anthropic import AsyncAnthropic
+from anthropic.types import TextBlock
 from openai import AsyncOpenAI
 
 from backend.prompt_loader import load_and_render, load_field_examples
@@ -29,6 +31,9 @@ _PRICING = {
     "gpt-5.4":            {"input": 10.00 / 1e6, "output": 30.00 / 1e6},
 }
 
+# Default number of JSON-parse retry attempts.
+_DEFAULT_RETRIES = 2
+
 
 def _estimate_cost(usage_records: list[dict]) -> float:
     """Sum up estimated cost from a list of {model, input_tokens, output_tokens}."""
@@ -39,6 +44,16 @@ def _estimate_cost(usage_records: list[dict]) -> float:
         total += rec["output_tokens"] * prices["output"]
     return round(total, 4)
 
+
+# Each tuple is (prompt_yaml_filename, pass_name_key).
+# The six passes analyze the same essay through different economic lenses:
+#   identities    — accounting identities and hidden assumptions
+#   general_eq    — general-equilibrium effects ignored by partial analysis
+#   exog_endog    — which variables the author treats as fixed vs. determined
+#   quantitative  — empirical claims, magnitudes, and missing data
+#   consistency   — internal contradictions and logical gaps
+#   steelman      — strongest version of the argument + counterarguments
+# All six run in parallel (batched for rate limits); results are merged in Stage 2.5.
 STAGE2_PASSES = [
     ("stage2_identities.yaml", "identities"),
     ("stage2_general_eq.yaml", "general_eq"),
@@ -48,6 +63,64 @@ STAGE2_PASSES = [
     ("stage2_steelman.yaml", "steelman"),
 ]
 
+# Correction message appended when a model returns invalid JSON.
+_JSON_CORRECTION_MSG = (
+    "Your response contained invalid JSON. Please return the "
+    "complete response again as valid JSON. Ensure all strings "
+    "are properly escaped (especially quotes and newlines within "
+    "strings). Return only the JSON, no other text."
+)
+
+
+async def _retry_on_bad_json(
+    api_call: Callable[[], Coroutine[Any, Any, tuple[str, int, int]]],
+    build_correction_messages: Callable[[str], None],
+    retries: int = _DEFAULT_RETRIES,
+) -> tuple[str, int, int]:
+    """Shared retry loop used by both _call_claude and _call_openai.
+
+    Calls ``api_call()`` up to ``retries + 1`` times. After each call it
+    attempts JSON parsing. On failure it calls ``build_correction_messages``
+    (which mutates the caller's ``messages`` list in place) and retries.
+
+    Args:
+        api_call: Async callable that performs one API round-trip and returns
+                  ``(text, input_tokens, output_tokens)``.
+        build_correction_messages: Callable that receives the bad ``text`` and
+                                   updates the messages list for the next attempt.
+        retries: Maximum number of extra attempts after the first.
+
+    Returns:
+        ``(text, total_input_tokens, total_output_tokens)`` from the last
+        successful (or final failed) attempt.
+    """
+    total_input = 0
+    total_output = 0
+
+    for attempt in range(retries + 1):
+        text, inp, out = await api_call()
+        total_input += inp
+        total_output += out
+
+        try:
+            _extract_json(text)
+            return text, total_input, total_output
+        except (json.JSONDecodeError, ValueError):
+            if attempt < retries:
+                logger.warning(
+                    "JSON parse failed (attempt %d/%d), retrying with correction "
+                    "prompt...",
+                    attempt + 1,
+                    retries + 1,
+                )
+                build_correction_messages(text)
+            else:
+                # Last attempt failed — return as-is, let caller handle it.
+                return text, total_input, total_output
+
+    # Unreachable, but satisfies type checkers.
+    return text, total_input, total_output  # type: ignore[return-value]
+
 
 async def _call_claude(
     client: AsyncAnthropic,
@@ -56,60 +129,49 @@ async def _call_claude(
     user_prompt: str,
     temperature: float,
     max_tokens: int,
-    retries: int = 2,
+    retries: int = _DEFAULT_RETRIES,
 ) -> tuple[str, dict]:
     """Make a single Claude API call and return (text, usage_record).
 
     If the response fails JSON parsing, retries with a nudge to produce valid JSON.
     """
-    messages = [{"role": "user", "content": user_prompt}]
-    total_input = 0
-    total_output = 0
+    messages: list[dict] = [{"role": "user", "content": user_prompt}]
 
-    for attempt in range(retries + 1):
+    async def api_call() -> tuple[str, int, int]:
         response = await client.messages.create(
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
             system=system_prompt,
-            messages=messages,
+            messages=messages,  # type: ignore[arg-type]
         )
-        text = response.content[0].text
-        total_input += response.usage.input_tokens
-        total_output += response.usage.output_tokens
-
+        text_block = response.content[0]
+        if not isinstance(text_block, TextBlock):
+            raise ValueError(f"Expected TextBlock, got {type(text_block).__name__}")
+        text = text_block.text
         if response.stop_reason != "end_turn":
             logger.warning(
-                f"Response truncated (stop_reason={response.stop_reason}, "
-                f"{len(text)} chars). Consider increasing max_tokens."
+                "Response truncated (stop_reason=%s, %d chars). "
+                "Consider increasing max_tokens.",
+                response.stop_reason,
+                len(text),
             )
+        return text, response.usage.input_tokens, response.usage.output_tokens
 
-        # Try parsing. If it works, return immediately.
-        try:
-            _extract_json(text)
-            usage = {"model": model, "input_tokens": total_input, "output_tokens": total_output}
-            return text, usage
-        except (json.JSONDecodeError, ValueError):
-            if attempt < retries:
-                logger.warning(
-                    f"JSON parse failed (attempt {attempt + 1}/{retries + 1}), "
-                    f"retrying with correction prompt..."
-                )
-                # Ask the model to fix its own output
-                messages = [
-                    {"role": "user", "content": user_prompt},
-                    {"role": "assistant", "content": text},
-                    {"role": "user", "content": (
-                        "Your response contained invalid JSON. Please return the "
-                        "complete response again as valid JSON. Ensure all strings "
-                        "are properly escaped (especially quotes and newlines within "
-                        "strings). Return only the JSON, no other text."
-                    )},
-                ]
-            else:
-                # Last attempt failed. Return as-is, let caller handle it.
-                usage = {"model": model, "input_tokens": total_input, "output_tokens": total_output}
-                return text, usage
+    def build_correction_messages(bad_text: str) -> None:
+        # messages[:] mutates the list in place so the api_call closure
+        # (which captured the same list object) sees the updated history.
+        messages[:] = [
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": bad_text},
+            {"role": "user", "content": _JSON_CORRECTION_MSG},
+        ]
+
+    text, total_input, total_output = await _retry_on_bad_json(
+        api_call, build_correction_messages, retries
+    )
+    usage = {"model": model, "input_tokens": total_input, "output_tokens": total_output}
+    return text, usage
 
 
 def _map_model_for_openai(model: str) -> str:
@@ -121,7 +183,8 @@ def _map_model_for_openai(model: str) -> str:
     return model_map.get(model, model)
 
 
-# Models that only accept temperature=1 (the default)
+# gpt-5-mini uses a fixed sampling temperature and rejects any explicit value.
+# Passing temperature= raises an API error, so we omit it for this model.
 _OPENAI_NO_TEMPERATURE = {"gpt-5-mini"}
 
 
@@ -132,84 +195,70 @@ async def _call_openai(
     user_prompt: str,
     temperature: float,
     max_tokens: int,
-    retries: int = 2,
+    retries: int = _DEFAULT_RETRIES,
 ) -> tuple[str, dict]:
-    """Make a single OpenAI Chat Completions API call and return (text, usage_record)."""
+    """Make a single OpenAI Chat Completions API call and return (text, usage_record).
+    """
     model = _map_model_for_openai(model)
-    messages = [
+    messages: list[dict] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    total_input = 0
-    total_output = 0
 
-    base_kwargs = dict(
-        model=model,
-        max_completion_tokens=max_tokens,
-        messages=messages,
-        response_format={"type": "json_object"},
-    )
+    base_kwargs: dict[str, Any] = {
+        "model": model,
+        "max_completion_tokens": max_tokens,
+        "messages": messages,
+        # json_object mode forces the model to return valid JSON, eliminating
+        # most parse failures without needing the correction-prompt retry loop.
+        "response_format": {"type": "json_object"},
+    }
     if model not in _OPENAI_NO_TEMPERATURE:
         base_kwargs["temperature"] = temperature
 
-    for attempt in range(retries + 1):
+    async def api_call() -> tuple[str, int, int]:
         base_kwargs["messages"] = messages
         response = await client.chat.completions.create(**base_kwargs)
         choice = response.choices[0]
         text = choice.message.content
-        if response.usage:
-            total_input += response.usage.prompt_tokens
-            total_output += response.usage.completion_tokens
-
         if choice.finish_reason == "length":
             logger.warning(
-                f"OpenAI response truncated ({len(text)} chars). "
-                f"Consider increasing max_tokens."
+                "OpenAI response truncated (%d chars). Consider increasing max_tokens.",
+                len(text),
             )
+        inp = response.usage.prompt_tokens if response.usage else 0
+        out = response.usage.completion_tokens if response.usage else 0
+        return text, inp, out
 
-        try:
-            _extract_json(text)
-            usage = {"model": model, "input_tokens": total_input, "output_tokens": total_output}
-            return text, usage
-        except (json.JSONDecodeError, ValueError):
-            if attempt < retries:
-                logger.warning(
-                    "OpenAI JSON parse failed (attempt %s/%s), retrying...",
-                    attempt + 1,
-                    retries + 1,
-                )
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                    {"role": "assistant", "content": text},
-                    {
-                        "role": "user",
-                        "content": (
-                            "Your response contained invalid JSON. Please return "
-                            "the complete response again as valid JSON. Ensure all "
-                            "strings are properly escaped. Return only JSON."
-                        ),
-                    },
-                ]
-            else:
-                usage = {"model": model, "input_tokens": total_input, "output_tokens": total_output}
-                return text, usage
+    def build_correction_messages(bad_text: str) -> None:
+        messages[:] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": bad_text},
+            {"role": "user", "content": _JSON_CORRECTION_MSG},
+        ]
+
+    text, total_input, total_output = await _retry_on_bad_json(
+        api_call, build_correction_messages, retries
+    )
+    usage = {"model": model, "input_tokens": total_input, "output_tokens": total_output}
+    return text, usage
 
 
 async def _call_model(
-    client,
+    client: AsyncAnthropic | AsyncOpenAI,
     provider: str,
     model: str,
     system_prompt: str,
     user_prompt: str,
     temperature: float,
     max_tokens: int,
-    retries: int = 2,
+    retries: int = _DEFAULT_RETRIES,
 ) -> tuple[str, dict]:
     """Route model calls to Claude or OpenAI. Returns (text, usage_record)."""
     if provider == "openai":
         return await _call_openai(
-            client,
+            client,  # type: ignore[arg-type]
             model,
             system_prompt,
             user_prompt,
@@ -219,7 +268,7 @@ async def _call_model(
         )
 
     return await _call_claude(
-        client,
+        client,  # type: ignore[arg-type]
         model,
         system_prompt,
         user_prompt,
@@ -229,26 +278,14 @@ async def _call_model(
     )
 
 
-# Directory for saving raw responses for debugging
-_RAW_OUTPUT_DIR = Path(__file__).parent.parent / "eval" / "outputs" / "_raw"
-
-
-def _save_raw(stage_name: str, text: str):
-    """Save raw API response for debugging."""
-    _RAW_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    path = _RAW_OUTPUT_DIR / f"{stage_name}.txt"
-    path.write_text(text)
-    logger.debug(f"Saved raw response to {path}")
-
-
-def _extract_json(text: str) -> dict:
+def _extract_json(text: str) -> dict[str, Any]:
     """Extract JSON from a response that might contain markdown fences or truncation."""
     text = text.strip()
     # Strip ```json ... ``` fences
     if text.startswith("```"):
         lines = text.split("\n")
         # Remove first line (```json) and last line (```)
-        lines = [l for l in lines[1:] if not l.strip() == "```"]
+        lines = [line for line in lines[1:] if line.strip() != "```"]
         text = "\n".join(lines)
     try:
         return json.loads(text)
@@ -312,7 +349,9 @@ def _repair_truncated_json(text: str) -> str:
                 safe_positions.append(i + 1)
 
     if not safe_positions:
-        raise json.JSONDecodeError("Cannot repair: no safe truncation point found", text, 0)
+        raise json.JSONDecodeError(
+            "Cannot repair: no safe truncation point found", text, 0
+        )
 
     # Trim to the last safe position
     last_safe = safe_positions[-1]
@@ -348,12 +387,21 @@ def _repair_truncated_json(text: str) -> str:
     result = truncated + ']' * open_brackets + '}' * open_braces
 
     cut = len(text) - last_safe
-    logger.warning(f"Repaired truncated JSON (cut {cut} trailing chars, "
-                   f"closed {open_brackets} brackets, {open_braces} braces)")
+    logger.warning(
+        "Repaired truncated JSON (cut %d trailing chars, "
+        "closed %d brackets, %d braces)",
+        cut,
+        open_brackets,
+        open_braces,
+    )
     return result
 
 
-async def run_stage1(client, source_text: str, provider: str = "anthropic") -> tuple[dict, dict]:
+async def run_stage1(
+    client: AsyncAnthropic | AsyncOpenAI,
+    source_text: str,
+    provider: str = "anthropic",
+) -> tuple[dict, dict]:
     """Stage 1: Decompose the source text into structural components."""
     logger.info("Stage 1: Decomposition")
     prompt = load_and_render("stage1_decomposition.yaml", source_text=source_text)
@@ -370,7 +418,7 @@ async def run_stage1(client, source_text: str, provider: str = "anthropic") -> t
 
 
 async def _run_single_pass(
-    client,
+    client: AsyncAnthropic | AsyncOpenAI,
     provider: str,
     yaml_file: str,
     pass_name: str,
@@ -379,7 +427,7 @@ async def _run_single_pass(
     field_examples: dict[str, str] | None = None,
 ) -> tuple[str, dict, dict]:
     """Run a single Stage 2 analysis pass. Returns (pass_name, result_dict, usage)."""
-    logger.info(f"Stage 2: {pass_name}")
+    logger.info("Stage 2: %s", pass_name)
     runtime_vars = dict(
         source_text=source_text,
         decomposition=decomposition_json,
@@ -401,7 +449,7 @@ async def _run_single_pass(
 
 
 async def run_stage2(
-    client,
+    client: AsyncAnthropic | AsyncOpenAI,
     source_text: str,
     decomposition: dict,
     provider: str = "anthropic",
@@ -421,17 +469,22 @@ async def run_stage2(
     logger.info("Stage 2: Parallel analysis passes")
     decomposition_json = json.dumps(decomposition, indent=2)
 
-    # Load field-specific examples based on stage 1 classification
+    # Stage 1 classifies the essay into an economics sub-field (e.g. macro_fiscal,
+    # trade, labor). Field-specific few-shot examples are injected into each Stage 2
+    # prompt so the model uses domain-appropriate terminology and framings.
     field = decomposition.get("field", "macro_fiscal")
     field_examples = load_field_examples(field)
-    logger.info(f"  Field classification: {field}")
+    logger.info("  Field classification: %s", field)
 
+    # Run passes in small batches to stay within API rate limits.
+    # With long essays each call uses ~10k input tokens; at batch_size=2 we
+    # send 2 concurrent requests, pause, then send the next 2, etc.
     results = {}
     usage_records = []
     for i in range(0, len(STAGE2_PASSES), batch_size):
         batch = STAGE2_PASSES[i:i + batch_size]
         if i > 0:
-            logger.info(f"  Rate limit pause ({batch_delay}s)...")
+            logger.info("  Rate limit pause (%.1fs)...", batch_delay)
             await asyncio.sleep(batch_delay)
         tasks = [
             _run_single_pass(
@@ -449,7 +502,7 @@ async def run_stage2(
 
 
 async def run_stage2_5(
-    client,
+    client: AsyncAnthropic | AsyncOpenAI,
     decomposition: dict,
     stage2_results: dict[str, dict],
     provider: str = "anthropic",
@@ -481,7 +534,7 @@ async def run_stage2_5(
 
 
 async def run_stage3(
-    client,
+    client: AsyncAnthropic | AsyncOpenAI,
     source_text: str,
     decomposition: dict,
     merged_annotations: dict,
@@ -508,7 +561,7 @@ async def run_stage3(
 
 
 async def run_pipeline(
-    client,
+    client: AsyncAnthropic | AsyncOpenAI,
     source_text: str,
     provider: str = "anthropic",
     on_stage_complete=None,
@@ -517,7 +570,7 @@ async def run_pipeline(
     Run the full analysis pipeline on a source text.
 
     Args:
-        client: AsyncAnthropic client instance
+        client: AsyncAnthropic or AsyncOpenAI client instance
         source_text: The raw text to analyze
         on_stage_complete: Optional callback(stage_name, result) for progress tracking
 
@@ -567,7 +620,7 @@ async def run_pipeline(
         on_stage_complete("synthesis", synthesis)
 
     estimated_cost = _estimate_cost(all_usage)
-    logger.info(f"Pipeline complete. Estimated API cost: ${estimated_cost:.4f}")
+    logger.info("Pipeline complete. Estimated API cost: $%.4f", estimated_cost)
 
     return {
         "workflow": provider,
