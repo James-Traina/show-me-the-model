@@ -10,10 +10,10 @@ Stage 3:   Synthesis (1 Opus call)
 import asyncio
 import json
 import logging
-from pathlib import Path
 from typing import Any, Callable, Coroutine
 
 from anthropic import AsyncAnthropic
+from anthropic.types import TextBlock
 from openai import AsyncOpenAI
 
 from backend.prompt_loader import load_and_render, load_field_examples
@@ -134,9 +134,12 @@ async def _call_claude(
             max_tokens=max_tokens,
             temperature=temperature,
             system=system_prompt,
-            messages=messages,
+            messages=messages,  # type: ignore[arg-type]
         )
-        text = response.content[0].text
+        text_block = response.content[0]
+        if not isinstance(text_block, TextBlock):
+            raise ValueError(f"Expected TextBlock, got {type(text_block).__name__}")
+        text = text_block.text
         if response.stop_reason != "end_turn":
             logger.warning(
                 "Response truncated (stop_reason=%s, %d chars). "
@@ -190,12 +193,12 @@ async def _call_openai(
         {"role": "user", "content": user_prompt},
     ]
 
-    base_kwargs: dict[str, Any] = dict(
-        model=model,
-        max_completion_tokens=max_tokens,
-        messages=messages,
-        response_format={"type": "json_object"},
-    )
+    base_kwargs: dict[str, Any] = {
+        "model": model,
+        "max_completion_tokens": max_tokens,
+        "messages": messages,
+        "response_format": {"type": "json_object"},
+    }
     if model not in _OPENAI_NO_TEMPERATURE:
         base_kwargs["temperature"] = temperature
 
@@ -259,18 +262,6 @@ async def _call_model(
         max_tokens,
         retries,
     )
-
-
-# Directory for saving raw responses for debugging
-_RAW_OUTPUT_DIR = Path(__file__).parent.parent / "eval" / "outputs" / "_raw"
-
-
-def _save_raw(stage_name: str, text: str):
-    """Save raw API response for debugging."""
-    _RAW_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    path = _RAW_OUTPUT_DIR / f"{stage_name}.txt"
-    path.write_text(text)
-    logger.debug("Saved raw response to %s", path)
 
 
 def _extract_json(text: str) -> dict[str, Any]:
