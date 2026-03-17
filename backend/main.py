@@ -13,7 +13,6 @@ from openai import AsyncOpenAI
 from fastapi import FastAPI, Header, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
 from sse_starlette.sse import EventSourceResponse
 
 from backend.jobs import JobStore, JobStatus
@@ -59,14 +58,6 @@ async def _cleanup_loop():
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(_cleanup_loop())
-
-
-# --- Request models ---
-
-class AnalyzeRequest(BaseModel):
-    text: str | None = None
-    url: str | None = None
-    email: str | None = None
 
 
 # --- Pipeline background task ---

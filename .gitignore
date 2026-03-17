@@ -9,3 +9,4 @@ frontend/public/sample-result.json
 *.egg-info/
 .venv/
 venv/
+node_modules/
