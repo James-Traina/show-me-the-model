@@ -6,25 +6,45 @@ import logging
 import os
 import re
 import secrets
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import AsyncGenerator
 
 from anthropic import AsyncAnthropic
-from openai import AsyncOpenAI
-from fastapi import FastAPI, Header, HTTPException, Request, UploadFile, File, Form
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
+from fastapi.responses import JSONResponse
+from openai import AsyncOpenAI
+from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from backend.jobs import JobStore, JobStatus
-from backend.pipeline import run_pipeline
-from backend.text_extract import extract_from_url, extract_from_pdf, validate_text
 from backend.email_notify import send_results_email
+from backend.jobs import STAGE_NAMES, JobStatus, JobStore
+from backend.pipeline import run_pipeline
+from backend.text_extract import extract_from_pdf, extract_from_url, validate_text
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Show Me the Model", version="0.1.0")
+store = JobStore()
+
+
+# --- Cleanup task ---
+
+async def _cleanup_loop() -> None:
+    """Periodically remove expired jobs."""
+    while True:
+        await asyncio.sleep(3600)
+        store.cleanup_expired()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    asyncio.create_task(_cleanup_loop())
+    yield
+
+
+app = FastAPI(title="Show Me the Model", version="0.1.0", lifespan=lifespan)
 
 # CORS
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
@@ -36,30 +56,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-store = JobStore()
-
-# Stage metadata for SSE events
-STAGE_NAMES = {
-    "decomposition": "Decomposition",
-    "stage2": "Analysis Passes",
-    "dedup": "Dedup & Merge",
-    "synthesis": "Synthesis",
-}
-
-
-# --- Cleanup task ---
-
-async def _cleanup_loop():
-    """Periodically remove expired jobs."""
-    while True:
-        await asyncio.sleep(3600)
-        store.cleanup_expired()
-
-
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(_cleanup_loop())
-
 
 # --- Request models ---
 
@@ -69,9 +65,48 @@ class AnalyzeRequest(BaseModel):
     email: str | None = None
 
 
-# --- Pipeline background task ---
+# --- Helpers ---
 
-async def _run_job(job_id: str, api_key: str, base_url: str, provider: str):
+async def _resolve_source_text(
+    text: str | None,
+    url: str | None,
+    file: UploadFile | None,
+    body: dict,
+) -> tuple[str, str, str | None]:
+    """Resolve whichever input source was provided.
+
+    Returns (source_text, input_mode, source_url).
+    """
+    # Fall back to JSON body fields when no form fields were provided
+    if text is None and url is None and file is None:
+        text = body.get("text")
+        url = body.get("url")
+
+    sources = sum(1 for s in [text, url, file] if s is not None)
+    if sources == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide exactly one input: text, url, or file (PDF upload)",
+        )
+    if sources > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide exactly one input: text, url, or file (PDF upload)",
+        )
+
+    try:
+        if text:
+            return validate_text(text), "text", None
+        elif url:
+            return await extract_from_url(url), "url", url
+        else:
+            pdf_bytes = await file.read()
+            return await extract_from_pdf(pdf_bytes), "pdf", None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+async def _run_job(job_id: str, api_key: str, base_url: str, provider: str) -> None:
     """Run the pipeline in the background, pushing events to the job's queue."""
     job = store.get(job_id)
     if not job:
@@ -79,7 +114,7 @@ async def _run_job(job_id: str, api_key: str, base_url: str, provider: str):
 
     job.status = JobStatus.RUNNING
 
-    def on_stage_complete(stage_name: str, result):
+    def on_stage_complete(stage_name: str, result: object) -> None:
         """Synchronous callback invoked by run_pipeline."""
         job.stages_completed.append(stage_name)
         job.partial_results[stage_name] = result
@@ -118,7 +153,9 @@ async def _run_job(job_id: str, api_key: str, base_url: str, provider: str):
 
         job.final_result = result
         job.status = JobStatus.COMPLETED
-        job.queue.put_nowait(("done", {"job_id": job.id, "analysis_id": analysis_id, "result": result}))
+        job.queue.put_nowait(
+            ("done", {"job_id": job.id, "analysis_id": analysis_id, "result": result})
+        )
 
         # Save result to disk
         results_dir = Path(__file__).resolve().parent.parent / "results"
@@ -154,7 +191,7 @@ async def _run_job(job_id: str, api_key: str, base_url: str, provider: str):
 # --- Routes ---
 
 @app.get("/health")
-async def health():
+async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
@@ -167,58 +204,34 @@ async def analyze(
     file: UploadFile | None = File(None),
     x_api_key: str | None = Header(None),
     x_provider: str | None = Header(None),
-):
-    """Submit text for analysis. Accepts JSON body or multipart form (for PDF upload)."""
+) -> dict[str, str]:
+    """Submit text for analysis.
+
+    Accepts JSON body or multipart form (for PDF upload).
+    """
     api_key = x_api_key
     provider = (x_provider or "anthropic").strip().lower()
     if provider not in {"anthropic", "openai"}:
-        raise HTTPException(status_code=400, detail="X-Provider must be one of: anthropic, openai")
+        raise HTTPException(
+            status_code=400, detail="X-Provider must be one of: anthropic, openai"
+        )
 
-    # If no form fields were provided, try parsing as JSON body
+    # Parse JSON body if no form fields were provided
+    body: dict = {}
     if text is None and url is None and file is None:
         try:
             body = await request.json()
-            text = body.get("text")
-            url = body.get("url")
-            email = body.get("email")
+            email = email or body.get("email")
         except Exception:
             pass
 
     if not api_key:
         raise HTTPException(status_code=401, detail="X-Api-Key header is required")
 
-    # Validate exactly one input source
-    sources = sum(1 for s in [text, url, file] if s is not None)
-    if sources == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide exactly one input: text, url, or file (PDF upload)",
-        )
-    if sources > 1:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide exactly one input: text, url, or file (PDF upload)",
-        )
+    source_text, input_mode, source_url = await _resolve_source_text(
+        text, url, file, body
+    )
 
-    # Extract text from the input source
-    try:
-        if text:
-            source_text = validate_text(text)
-            input_mode = "text"
-            source_url = None
-        elif url:
-            source_text = await extract_from_url(url)
-            input_mode = "url"
-            source_url = url
-        else:
-            pdf_bytes = await file.read()
-            source_text = await extract_from_pdf(pdf_bytes)
-            input_mode = "pdf"
-            source_url = None
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    # Create job and spawn background task
     job = store.create(
         source_text=source_text,
         email=email,
@@ -235,13 +248,13 @@ async def analyze(
 
 
 @app.get("/jobs/{job_id}/stream")
-async def stream_job(job_id: str):
+async def stream_job(job_id: str) -> EventSourceResponse:
     """SSE stream of pipeline progress events."""
     job = store.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    async def event_generator():
+    async def event_generator() -> AsyncGenerator[dict, None]:
         while True:
             msg = await job.queue.get()
             if msg is None:
@@ -254,7 +267,7 @@ async def stream_job(job_id: str):
 
 
 @app.get("/jobs/{job_id}")
-async def get_job(job_id: str):
+async def get_job(job_id: str) -> dict:
     """Poll for current job state."""
     job = store.get(job_id)
     if not job:
@@ -263,7 +276,7 @@ async def get_job(job_id: str):
 
 
 @app.get("/results/{analysis_id}")
-async def get_result(analysis_id: str):
+async def get_result(analysis_id: str) -> JSONResponse:
     """Fetch a saved analysis result by its short ID."""
     # Validate ID format to prevent path traversal
     if not re.match(r'^[A-Za-z0-9_-]{6,12}$', analysis_id):
