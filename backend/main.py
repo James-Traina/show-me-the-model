@@ -9,17 +9,17 @@ import secrets
 from pathlib import Path
 
 from anthropic import AsyncAnthropic
-from openai import AsyncOpenAI
-from fastapi import FastAPI, Header, HTTPException, Request, UploadFile, File, Form
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
+from fastapi.responses import JSONResponse
+from openai import AsyncOpenAI
+from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from backend.jobs import JobStore, JobStatus
-from backend.pipeline import run_pipeline
-from backend.text_extract import extract_from_url, extract_from_pdf, validate_text
 from backend.email_notify import send_results_email
+from backend.jobs import JobStatus, JobStore
+from backend.pipeline import run_pipeline
+from backend.text_extract import extract_from_pdf, extract_from_url, validate_text
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -49,6 +49,7 @@ STAGE_NAMES = {
 
 # --- Cleanup task ---
 
+
 async def _cleanup_loop():
     """Periodically remove expired jobs."""
     while True:
@@ -63,6 +64,7 @@ async def startup():
 
 # --- Request models ---
 
+
 class AnalyzeRequest(BaseModel):
     text: str | None = None
     url: str | None = None
@@ -70,6 +72,7 @@ class AnalyzeRequest(BaseModel):
 
 
 # --- Pipeline background task ---
+
 
 async def _run_job(job_id: str, api_key: str, base_url: str, provider: str):
     """Run the pipeline in the background, pushing events to the job's queue."""
@@ -118,7 +121,9 @@ async def _run_job(job_id: str, api_key: str, base_url: str, provider: str):
 
         job.final_result = result
         job.status = JobStatus.COMPLETED
-        job.queue.put_nowait(("done", {"job_id": job.id, "analysis_id": analysis_id, "result": result}))
+        job.queue.put_nowait(
+            ("done", {"job_id": job.id, "analysis_id": analysis_id, "result": result})
+        )
 
         # Save result to disk
         results_dir = Path(__file__).resolve().parent.parent / "results"
@@ -143,15 +148,14 @@ async def _run_job(job_id: str, api_key: str, base_url: str, provider: str):
                 failed_stage = s
                 break
         job.error_stage = failed_stage
-        job.queue.put_nowait(
-            ("error", {"message": str(exc), "stage": failed_stage})
-        )
+        job.queue.put_nowait(("error", {"message": str(exc), "stage": failed_stage}))
     finally:
         # Signal end-of-stream
         job.queue.put_nowait(None)
 
 
 # --- Routes ---
+
 
 @app.get("/health")
 async def health():
@@ -168,11 +172,13 @@ async def analyze(
     x_api_key: str | None = Header(None),
     x_provider: str | None = Header(None),
 ):
-    """Submit text for analysis. Accepts JSON body or multipart form (for PDF upload)."""
+    """Submit text for analysis. Accepts JSON body or multipart form (PDF upload)."""
     api_key = x_api_key
     provider = (x_provider or "anthropic").strip().lower()
     if provider not in {"anthropic", "openai"}:
-        raise HTTPException(status_code=400, detail="X-Provider must be one of: anthropic, openai")
+        raise HTTPException(
+            status_code=400, detail="X-Provider must be one of: anthropic, openai"
+        )
 
     # If no form fields were provided, try parsing as JSON body
     if text is None and url is None and file is None:
@@ -266,7 +272,7 @@ async def get_job(job_id: str):
 async def get_result(analysis_id: str):
     """Fetch a saved analysis result by its short ID."""
     # Validate ID format to prevent path traversal
-    if not re.match(r'^[A-Za-z0-9_-]{6,12}$', analysis_id):
+    if not re.match(r"^[A-Za-z0-9_-]{6,12}$", analysis_id):
         raise HTTPException(status_code=400, detail="Invalid analysis ID format")
 
     results_dir = Path(__file__).resolve().parent.parent / "results"

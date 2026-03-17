@@ -1,7 +1,7 @@
 """Text extraction from URLs, PDFs, and raw text with validation."""
 
-import re
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +49,8 @@ async def extract_from_url(url: str) -> str:
         raise ValueError(f"Could not extract text from URL: {url}")
     if len(text) > MAX_TEXT_LENGTH:
         raise ValueError(
-            f"Extracted text too long ({len(text)} chars). Maximum is {MAX_TEXT_LENGTH}."
+            f"Extracted text too long ({len(text)} chars). "
+            f"Maximum is {MAX_TEXT_LENGTH}."
         )
     return text
 
@@ -72,6 +73,7 @@ async def extract_from_pdf(file_bytes: bytes) -> str:
         raise ValueError("Could not extract text from PDF (empty or image-only)")
     if len(text) > MAX_TEXT_LENGTH:
         raise ValueError(
-            f"Extracted text too long ({len(text)} chars). Maximum is {MAX_TEXT_LENGTH}."
+            f"Extracted text too long ({len(text)} chars). "
+            f"Maximum is {MAX_TEXT_LENGTH}."
         )
     return text

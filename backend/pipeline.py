@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
+
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 
@@ -22,11 +23,11 @@ logger = logging.getLogger(__name__)
 # Keys must match the model strings actually sent to each API.
 _PRICING = {
     # Anthropic
-    "claude-sonnet-4-6":  {"input": 3.00 / 1e6, "output": 15.00 / 1e6},
-    "claude-opus-4-6":    {"input": 15.00 / 1e6, "output": 75.00 / 1e6},
+    "claude-sonnet-4-6": {"input": 3.00 / 1e6, "output": 15.00 / 1e6},
+    "claude-opus-4-6": {"input": 15.00 / 1e6, "output": 75.00 / 1e6},
     # OpenAI (mapped names)
-    "gpt-5-mini":         {"input": 1.50 / 1e6, "output": 6.00 / 1e6},
-    "gpt-5.4":            {"input": 10.00 / 1e6, "output": 30.00 / 1e6},
+    "gpt-5-mini": {"input": 1.50 / 1e6, "output": 6.00 / 1e6},
+    "gpt-5.4": {"input": 10.00 / 1e6, "output": 30.00 / 1e6},
 }
 
 
@@ -38,6 +39,7 @@ def _estimate_cost(usage_records: list[dict]) -> float:
         total += rec["input_tokens"] * prices["input"]
         total += rec["output_tokens"] * prices["output"]
     return round(total, 4)
+
 
 STAGE2_PASSES = [
     ("stage2_identities.yaml", "identities"),
@@ -87,7 +89,11 @@ async def _call_claude(
         # Try parsing. If it works, return immediately.
         try:
             _extract_json(text)
-            usage = {"model": model, "input_tokens": total_input, "output_tokens": total_output}
+            usage = {
+                "model": model,
+                "input_tokens": total_input,
+                "output_tokens": total_output,
+            }
             return text, usage
         except (json.JSONDecodeError, ValueError):
             if attempt < retries:
@@ -99,16 +105,23 @@ async def _call_claude(
                 messages = [
                     {"role": "user", "content": user_prompt},
                     {"role": "assistant", "content": text},
-                    {"role": "user", "content": (
-                        "Your response contained invalid JSON. Please return the "
-                        "complete response again as valid JSON. Ensure all strings "
-                        "are properly escaped (especially quotes and newlines within "
-                        "strings). Return only the JSON, no other text."
-                    )},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your response contained invalid JSON. Please return the "
+                            "complete response again as valid JSON. Ensure all strings "
+                            "are properly escaped (especially quotes and newlines "
+                            "within strings). Return only the JSON, no other text."
+                        ),
+                    },
                 ]
             else:
                 # Last attempt failed. Return as-is, let caller handle it.
-                usage = {"model": model, "input_tokens": total_input, "output_tokens": total_output}
+                usage = {
+                    "model": model,
+                    "input_tokens": total_input,
+                    "output_tokens": total_output,
+                }
                 return text, usage
 
 
@@ -134,7 +147,7 @@ async def _call_openai(
     max_tokens: int,
     retries: int = 2,
 ) -> tuple[str, dict]:
-    """Make a single OpenAI Chat Completions API call and return (text, usage_record)."""
+    """Make a single OpenAI Chat Completions API call. Returns (text, usage_record)."""
     model = _map_model_for_openai(model)
     messages = [
         {"role": "system", "content": system_prompt},
@@ -169,7 +182,11 @@ async def _call_openai(
 
         try:
             _extract_json(text)
-            usage = {"model": model, "input_tokens": total_input, "output_tokens": total_output}
+            usage = {
+                "model": model,
+                "input_tokens": total_input,
+                "output_tokens": total_output,
+            }
             return text, usage
         except (json.JSONDecodeError, ValueError):
             if attempt < retries:
@@ -192,7 +209,11 @@ async def _call_openai(
                     },
                 ]
             else:
-                usage = {"model": model, "input_tokens": total_input, "output_tokens": total_output}
+                usage = {
+                    "model": model,
+                    "input_tokens": total_input,
+                    "output_tokens": total_output,
+                }
                 return text, usage
 
 
@@ -248,7 +269,7 @@ def _extract_json(text: str) -> dict:
     if text.startswith("```"):
         lines = text.split("\n")
         # Remove first line (```json) and last line (```)
-        lines = [l for l in lines[1:] if not l.strip() == "```"]
+        lines = [line for line in lines[1:] if not line.strip() == "```"]
         text = "\n".join(lines)
     try:
         return json.loads(text)
@@ -290,7 +311,7 @@ def _repair_truncated_json(text: str) -> str:
         if escape:
             escape = False
             continue
-        if ch == '\\' and in_string:
+        if ch == "\\" and in_string:
             escape = True
             continue
         if ch == '"':
@@ -298,21 +319,23 @@ def _repair_truncated_json(text: str) -> str:
             continue
         if in_string:
             continue
-        if ch in ('{', '['):
+        if ch in ("{", "["):
             stack.append(ch)
-        elif ch == '}':
+        elif ch == "}":
             stack.pop() if stack else None
             # After closing, if we're back to depth 1 (inside the root object/array),
             # this is a safe truncation point (right after a complete nested value)
             if len(stack) <= 2:
                 safe_positions.append(i + 1)
-        elif ch == ']':
+        elif ch == "]":
             stack.pop() if stack else None
             if len(stack) <= 2:
                 safe_positions.append(i + 1)
 
     if not safe_positions:
-        raise json.JSONDecodeError("Cannot repair: no safe truncation point found", text, 0)
+        raise json.JSONDecodeError(
+            "Cannot repair: no safe truncation point found", text, 0
+        )
 
     # Trim to the last safe position
     last_safe = safe_positions[-1]
@@ -328,7 +351,7 @@ def _repair_truncated_json(text: str) -> str:
         if escape:
             escape = False
             continue
-        if ch == '\\' and in_string:
+        if ch == "\\" and in_string:
             escape = True
             continue
         if ch == '"':
@@ -336,24 +359,28 @@ def _repair_truncated_json(text: str) -> str:
             continue
         if in_string:
             continue
-        if ch == '{':
+        if ch == "{":
             open_braces += 1
-        elif ch == '}':
+        elif ch == "}":
             open_braces -= 1
-        elif ch == '[':
+        elif ch == "[":
             open_brackets += 1
-        elif ch == ']':
+        elif ch == "]":
             open_brackets -= 1
 
-    result = truncated + ']' * open_brackets + '}' * open_braces
+    result = truncated + "]" * open_brackets + "}" * open_braces
 
     cut = len(text) - last_safe
-    logger.warning(f"Repaired truncated JSON (cut {cut} trailing chars, "
-                   f"closed {open_brackets} brackets, {open_braces} braces)")
+    logger.warning(
+        f"Repaired truncated JSON (cut {cut} trailing chars, "
+        f"closed {open_brackets} brackets, {open_braces} braces)"
+    )
     return result
 
 
-async def run_stage1(client, source_text: str, provider: str = "anthropic") -> tuple[dict, dict]:
+async def run_stage1(
+    client, source_text: str, provider: str = "anthropic"
+) -> tuple[dict, dict]:
     """Stage 1: Decompose the source text into structural components."""
     logger.info("Stage 1: Decomposition")
     prompt = load_and_render("stage1_decomposition.yaml", source_text=source_text)
@@ -429,14 +456,19 @@ async def run_stage2(
     results = {}
     usage_records = []
     for i in range(0, len(STAGE2_PASSES), batch_size):
-        batch = STAGE2_PASSES[i:i + batch_size]
+        batch = STAGE2_PASSES[i : i + batch_size]
         if i > 0:
             logger.info(f"  Rate limit pause ({batch_delay}s)...")
             await asyncio.sleep(batch_delay)
         tasks = [
             _run_single_pass(
-                client, provider, yaml_file, name,
-                source_text, decomposition_json, field_examples,
+                client,
+                provider,
+                yaml_file,
+                name,
+                source_text,
+                decomposition_json,
+                field_examples,
             )
             for yaml_file, name in batch
         ]
