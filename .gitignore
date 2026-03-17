@@ -9,3 +9,6 @@ frontend/public/sample-result.json
 *.egg-info/
 .venv/
 venv/
+.DS_Store
+node_modules/
+*.log
