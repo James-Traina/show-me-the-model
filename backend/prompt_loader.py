@@ -6,7 +6,6 @@ Two-stage templating:
   2. Runtime resolution: {{ source_text }}, {{ decomposition }}, etc. resolved at call time
 """
 
-import os
 import re
 import yaml
 from pathlib import Path
