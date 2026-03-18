@@ -46,6 +46,37 @@ The app is a React frontend + FastAPI backend. The frontend is a single-page app
 - **SSE events** use type `stage_complete` during the run and `done` / `error` on finish.
 - The frontend Vite config proxies `/api` → `http://localhost:8000` in dev. Don't hardcode the backend URL.
 
+## Linting
+
+```bash
+ruff check --select E,F,I,W backend/   # lint
+ruff format backend/                    # format
+cd frontend && npm run lint             # ESLint (after PR #4 merges)
+```
+
+Config: `pyproject.toml` (ruff), `frontend/eslint.config.js` (ESLint 9 flat config), `.prettierrc`
+
+Installing ESLint packages requires `--legacy-peer-deps` due to eslint-plugin-react peer conflict with `@eslint/js@10`.
+
+## Pyright / Type Checking
+
+`pyrightconfig.json` at repo root configures Python 3.11 + venv path. Without it, Pyright flags all `X | Y` union syntax and every third-party import as errors — all false positives.
+
+Type safety patterns:
+- `response.content[0].text` — guard with `isinstance(block, TextBlock)` (from `anthropic.types`)
+- `dict[str, Any]` annotations — use `{}` literal, not `dict()` constructor (avoids Pyright narrowing the value type)
+- Anthropic SDK `messages` param — use `# type: ignore[arg-type]` for `list[dict]`
+
+## Git / PR Workflow
+
+Branch from `master`; naming: `feature/`, `fix/`, `docs/`, `prompt/`
+
+`origin` = `James-Traina/show-me-the-model`; GitHub Issues are disabled on this fork — use PR comments for discussion.
+
+Parallel Claude agents use git worktrees: `git worktree list` / `git worktree remove <path>`
+
+PRs #9 and #12 both touch `main.py` — merge #9 before #12. PRs #4 and #7 both touch `frontend/package.json` — merge #4 before #7.
+
 ## What to Watch Out For
 
 - `pipeline.py` contains a hardcoded pricing table for cost estimation — update it if models or pricing change.
@@ -53,3 +84,6 @@ The app is a React frontend + FastAPI backend. The frontend is a single-page app
 - Input limits: 50,000 chars for text, 10 MB for PDFs.
 - The `eval/` directory contains gold-standard analyses used for prompt evaluation — don't delete or modify those files casually.
 - Stale planning files (`OPENAI_MIGRATION_PLAN.md`, `SUMMARY_DASHBOARD_PLAN.md`, `show-me-the-model-plan.md`, `visual-redesign*.jsx/md`, `next-time.md`) are in the root — these are historical artefacts, not current specs.
+- `batch_size=2` in `run_stage2` is intentional rate-limiting — don't change to full parallel.
+- After PR #9 merges: `STAGE_NAMES` lives in `backend/jobs.py`, not `main.py`.
+- After PR #11 merges: `App.jsx` state lives in `frontend/src/hooks/`, not inline.
