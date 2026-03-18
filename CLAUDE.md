@@ -18,22 +18,26 @@ cd frontend && npx vite build            # production build → frontend/dist/
 The app is a React frontend + FastAPI backend. The frontend is a single-page app; Vite proxies `/api` to the backend during development, and Nginx does the same in production.
 
 **Backend entry point:** `backend/main.py`
+
 - Routes: `POST /analyze`, `GET /jobs/{id}/stream` (SSE), `GET /jobs/{id}`, `GET /results/{id}`, `GET /health`
 - Background jobs run in asyncio tasks; progress is streamed to the frontend via Server-Sent Events
 
 **Pipeline:** `backend/pipeline.py`
+
 - 4 stages: decomposition → 6 parallel analysis passes → dedup/merge → synthesis
 - Each stage calls the LLM API and pushes a `stage_complete` SSE event
 - Supports both Anthropic and OpenAI; provider + API key come in per-request headers (`X-Provider`, `X-Api-Key`)
 - Tracks token usage and estimates cost using a pricing table at the top of the file
 
 **Prompts:** `prompts/`
+
 - Each stage has its own YAML file with `model`, `temperature`, `max_tokens`, `system_prompt`, and `user_prompt_template`
 - Shared fragments (persona, taxonomy) live in `prompts/shared/` and are injected via `{{shared:filename}}` placeholders
 - Field-specific examples are in `prompts/shared/examples/` and injected as `{{field_examples}}`
 - `backend/prompt_loader.py` handles loading, shared-var resolution, and runtime templating
 
 **Frontend state machine:** `frontend/src/App.jsx`
+
 - Phases: `idle` → `running` → `done` | `error`
 - Hash-based routing (`#/results/{analysisId}`) for shareable result links
 - API key and provider stored in `localStorage`
@@ -64,6 +68,7 @@ Installing ESLint packages requires `--legacy-peer-deps` due to eslint-plugin-re
 `pyrightconfig.json` at repo root configures Python 3.11 + venv path. Without it, Pyright flags all `X | Y` union syntax and every third-party import as errors — all false positives.
 
 Type safety patterns:
+
 - `response.content[0].text` — guard with `isinstance(block, TextBlock)` (from `anthropic.types`)
 - `dict[str, Any]` annotations — use `{}` literal, not `dict()` constructor (avoids Pyright narrowing the value type)
 - Anthropic SDK `messages` param — use `# type: ignore[arg-type]` for `list[dict]`
