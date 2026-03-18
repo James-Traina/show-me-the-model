@@ -9,4 +9,3 @@ frontend/public/sample-result.json
 *.egg-info/
 .venv/
 venv/
-.serena/
