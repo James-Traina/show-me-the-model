@@ -51,6 +51,7 @@ The app is a React frontend + FastAPI backend. The frontend is a single-page app
 ```bash
 ruff check --select E,F,I,W backend/   # lint
 ruff format backend/                    # format
+mypy backend/                           # type-check (reads [tool.mypy] from pyproject.toml — no CLI flags needed)
 cd frontend && npm run lint             # ESLint (after PR #4 merges)
 ```
 
@@ -77,6 +78,12 @@ Parallel Claude agents use git worktrees: `git worktree list` / `git worktree re
 
 PRs #9 and #12 both touch `main.py` — merge #9 before #12. PRs #4 and #7 both touch `frontend/package.json` — merge #4 before #7.
 
+Check a feature branch for merge conflicts before writing PR guides: `git merge-tree $(git merge-base master origin/feature/X) master origin/feature/X`
+
+When multiple open PRs touch the same file, put all edits in the earliest-merging PR — avoids trivial but annoying conflicts later.
+
+Update a PR description after adding commits to its branch: `gh pr edit <num> --repo <owner/repo> --body "..."`
+
 ## What to Watch Out For
 
 - `pipeline.py` contains a hardcoded pricing table for cost estimation — update it if models or pricing change.
@@ -84,6 +91,7 @@ PRs #9 and #12 both touch `main.py` — merge #9 before #12. PRs #4 and #7 both 
 - Input limits: 50,000 chars for text, 10 MB for PDFs.
 - The `eval/` directory contains gold-standard analyses used for prompt evaluation — don't delete or modify those files casually.
 - Stale planning files (`OPENAI_MIGRATION_PLAN.md`, `SUMMARY_DASHBOARD_PLAN.md`, `show-me-the-model-plan.md`, `visual-redesign*.jsx/md`, `next-time.md`) are in the root — these are historical artefacts, not current specs.
+- `DEPLOYMENT.md` at repo root documents production infrastructure (DigitalOcean droplet, Nginx, Resend, SSL). Read it before touching deployment-related code.
 - `batch_size=2` in `run_stage2` is intentional rate-limiting — don't change to full parallel.
 - After PR #9 merges: `STAGE_NAMES` lives in `backend/jobs.py`, not `main.py`.
 - After PR #11 merges: `App.jsx` state lives in `frontend/src/hooks/`, not inline.
